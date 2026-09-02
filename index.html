@@ -623,18 +623,49 @@ async function startCapture() {
         video.srcObject = mediaStream;
         await video.play();
         let torchOn = false;
+        const track = mediaStream.getVideoTracks()[0];
         try {
-            const track = mediaStream.getVideoTracks()[0];
             const caps = track.getCapabilities ? track.getCapabilities() : {};
             if (caps.torch) { await track.applyConstraints({ advanced: [{ torch: true }] }); torchOn = true; }
         } catch (e) { /* torch optional */ }
-        beginScan(torchOn);
+        const locked = await attemptCameraLock(track);
+        beginScan(torchOn, locked);
     } catch (err) {
         alert("Camera access denied or unavailable. This scan needs camera permission to read pulse signal.");
     }
 }
 
-function beginScan(torchOn) {
+// Best-effort: most phone cameras keep auto-adjusting exposure/white-balance/
+// focus throughout a recording unless told not to, which shows up as sudden
+// brightness jumps mid-scan — exactly the kind of transient that can corrupt
+// simple baseline-subtraction PPG extraction. Lets auto-settings briefly
+// settle, reads back whatever values the camera landed on, then tries to pin
+// them for the rest of the scan. Support for these constraints is
+// inconsistent across browsers (mainly Android Chrome; likely unsupported on
+// iOS Safari) — this silently no-ops where unavailable rather than failing.
+async function attemptCameraLock(track) {
+    try {
+        await new Promise(r => setTimeout(r, 600));
+        const settings = track.getSettings ? track.getSettings() : {};
+        const caps = track.getCapabilities ? track.getCapabilities() : {};
+        const advanced = [];
+        if (caps.exposureMode && caps.exposureMode.includes('manual') && settings.exposureTime !== undefined) {
+            advanced.push({ exposureMode: 'manual', exposureTime: settings.exposureTime });
+        }
+        if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual') && settings.colorTemperature !== undefined) {
+            advanced.push({ whiteBalanceMode: 'manual', colorTemperature: settings.colorTemperature });
+        }
+        if (caps.focusMode && caps.focusMode.includes('manual') && settings.focusDistance !== undefined) {
+            advanced.push({ focusMode: 'manual', focusDistance: settings.focusDistance });
+        }
+        if (advanced.length) { await track.applyConstraints({ advanced }); return true; }
+        return false;
+    } catch (e) {
+        return false;
+    }
+}
+
+function beginScan(torchOn, exposureLocked) {
     running = true;
     scanStartTime = performance.now();
     times = []; filtered = []; dcBaseline = null; smoothBuf = []; rising = false;
@@ -648,7 +679,7 @@ function beginScan(torchOn) {
     freqPanel.style.display = 'none';
     bpmNumber.textContent = '—'; bpmNumber.classList.add('dim');
     hrConfidence.textContent = 'acquiring...'; hrConfidence.className = 'confidence';
-    ampStatus.textContent = torchOn ? 'torch on' : 'torch unavailable — use bright ambient light';
+    ampStatus.textContent = (torchOn ? 'torch on' : 'torch unavailable') + (exposureLocked ? ', exposure locked' : '');
     breathMarkBtn.style.display = 'block'; breathMarkBtn.textContent = 'Mark: inhale starting';
 
     if (scanMode === 'fixed30') {
@@ -838,6 +869,12 @@ function smoothForDisplay(values, windowSize) {
     });
 }
 
+function percentile(arr, p) {
+    const sorted = [...arr].sort((a, b) => a - b);
+    const idx = Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))));
+    return sorted[idx];
+}
+
 function drawWaveform() {
     const c = waveformCanvas.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
@@ -865,9 +902,16 @@ function drawWaveform() {
     // Display-only smoothing: a separate copy purely for the plotted line.
     // Peak detection (detectPeak) and the amplitude/quality readout above
     // both use the original `filtered`/visVals data untouched — only what
-    // gets drawn on screen is smoothed.
-    const displayVals = smoothForDisplay(visVals, 5);
-    const dmn = Math.min(...displayVals), dmx = Math.max(...displayVals);
+    // gets drawn on screen is smoothed. Window reduced from 5 to 3: now
+    // that rendering uses a pass-through spline (below) instead of straight
+    // segments, heavy pre-smoothing isn't needed to look clean, and a
+    // narrower window preserves fast features like a dicrotic notch better.
+    const displayVals = smoothForDisplay(visVals, 3);
+    // Percentile-based range instead of true min/max: a single camera-driven
+    // brightness jump (auto-exposure adjusting mid-scan) anywhere in this
+    // window would otherwise dominate the scale and make normal pulse waves
+    // elsewhere in the same window look artificially flattened.
+    const dmn = percentile(displayVals, 0.05), dmx = percentile(displayVals, 0.95);
     const drange = (dmx - dmn) || 1;
     const midY = chartH / 2, usable = chartH * 0.42;
     const xPix = i => (i / (windowN - 1)) * cssW;
@@ -890,13 +934,16 @@ function drawWaveform() {
         }
     }
 
-    // Smooth curve rendering: quadratic Bezier segments through the
-    // midpoint between each pair of consecutive points, using the point
-    // itself as the control point (standard "smooth line through points"
-    // technique). This removes the angular/sawtooth look of straight
-    // line-to-line-to segments WITHOUT adding any additional filtering —
-    // the underlying point values (and therefore fine detail like a
-    // dicrotic notch) are unchanged, only how they're visually connected.
+    // Smooth curve rendering via a Catmull-Rom spline (converted to cubic
+    // Bezier segments), NOT the midpoint-quadratic-through-control-points
+    // technique used in an earlier version. That technique only
+    // approximates each point rather than passing through it, and could
+    // blur out or visually mislocate a fast, narrow feature like a
+    // dicrotic notch — exactly the kind of thing this app is meant to
+    // reveal, not hide. Catmull-Rom guarantees the curve passes through
+    // every real sample position by construction, so the true location and
+    // presence of a notch is preserved; only the connecting geometry
+    // between points is smoothed, not the points themselves.
     const pts = displayVals.map((v, i) => {
         let norm = ((v - dmn) / drange - 0.5) * 2;
         norm = Math.max(-1.3, Math.min(1.3, norm));
@@ -908,12 +955,12 @@ function drawWaveform() {
         pts.forEach((p, i) => { if (i === 0) c.moveTo(p.x, p.y); else c.lineTo(p.x, p.y); });
     } else {
         c.moveTo(pts[0].x, pts[0].y);
-        c.lineTo((pts[0].x + pts[1].x) / 2, (pts[0].y + pts[1].y) / 2);
-        for (let i = 1; i < pts.length - 1; i++) {
-            const midX = (pts[i].x + pts[i + 1].x) / 2, midY2 = (pts[i].y + pts[i + 1].y) / 2;
-            c.quadraticCurveTo(pts[i].x, pts[i].y, midX, midY2);
+        for (let i = 0; i < pts.length - 1; i++) {
+            const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+            const cp1x = p1.x + (p2.x - p0.x) / 6, cp1y = p1.y + (p2.y - p0.y) / 6;
+            const cp2x = p2.x - (p3.x - p1.x) / 6, cp2y = p2.y - (p3.y - p1.y) / 6;
+            c.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
         }
-        c.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
     }
     c.stroke();
 
