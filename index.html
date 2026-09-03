@@ -740,7 +740,19 @@ function processFrame() {
 
     if (dcBaseline === null) dcBaseline = g;
     dcBaseline = dcBaseline * 0.97 + g * 0.03; // ~1-2s EMA time constant at ~30fps
-    const acRaw = g - dcBaseline;
+    // Systole (more blood in the fingertip) absorbs more of the flash's light,
+    // so the camera sees LESS brightness during systole and MORE during
+    // diastole — i.e. raw green-channel value g DROPS at the true pulse peak.
+    // Inverting here (baseline minus current, not current minus baseline) so
+    // systole produces a positive/upward deflection, matching how PPG traces
+    // are conventionally drawn and read. Without this inversion the detector
+    // was locking onto brightness maxima (diastole) rather than the true
+    // systolic peak, and — because the diastolic phase is where the gentler
+    // dicrotic notch/tidal wave live — inverted orientation made those
+    // secondary features look sharper/more peak-like than the true systolic
+    // upstroke, a likely contributor to the high false-detection rate seen
+    // in testing.
+    const acRaw = dcBaseline - g;
 
     smoothBuf.push(acRaw);
     if (smoothBuf.length > 2) smoothBuf.shift();
