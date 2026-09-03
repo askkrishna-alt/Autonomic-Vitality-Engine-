@@ -623,49 +623,33 @@ async function startCapture() {
         video.srcObject = mediaStream;
         await video.play();
         let torchOn = false;
-        const track = mediaStream.getVideoTracks()[0];
         try {
+            const track = mediaStream.getVideoTracks()[0];
             const caps = track.getCapabilities ? track.getCapabilities() : {};
             if (caps.torch) { await track.applyConstraints({ advanced: [{ torch: true }] }); torchOn = true; }
         } catch (e) { /* torch optional */ }
-        const locked = await attemptCameraLock(track);
-        beginScan(torchOn, locked);
+        beginScan(torchOn);
     } catch (err) {
         alert("Camera access denied or unavailable. This scan needs camera permission to read pulse signal.");
     }
 }
 
-// Best-effort: most phone cameras keep auto-adjusting exposure/white-balance/
-// focus throughout a recording unless told not to, which shows up as sudden
-// brightness jumps mid-scan — exactly the kind of transient that can corrupt
-// simple baseline-subtraction PPG extraction. Lets auto-settings briefly
-// settle, reads back whatever values the camera landed on, then tries to pin
-// them for the rest of the scan. Support for these constraints is
-// inconsistent across browsers (mainly Android Chrome; likely unsupported on
-// iOS Safari) — this silently no-ops where unavailable rather than failing.
-async function attemptCameraLock(track) {
-    try {
-        await new Promise(r => setTimeout(r, 600));
-        const settings = track.getSettings ? track.getSettings() : {};
-        const caps = track.getCapabilities ? track.getCapabilities() : {};
-        const advanced = [];
-        if (caps.exposureMode && caps.exposureMode.includes('manual') && settings.exposureTime !== undefined) {
-            advanced.push({ exposureMode: 'manual', exposureTime: settings.exposureTime });
-        }
-        if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual') && settings.colorTemperature !== undefined) {
-            advanced.push({ whiteBalanceMode: 'manual', colorTemperature: settings.colorTemperature });
-        }
-        if (caps.focusMode && caps.focusMode.includes('manual') && settings.focusDistance !== undefined) {
-            advanced.push({ focusMode: 'manual', focusDistance: settings.focusDistance });
-        }
-        if (advanced.length) { await track.applyConstraints({ advanced }); return true; }
-        return false;
-    } catch (e) {
-        return false;
-    }
-}
+// NOTE: an exposure/white-balance/focus-locking attempt was tried here and
+// reverted. The idea (pin auto-settings once they settle, to avoid mid-scan
+// brightness jumps) was reasonable in theory, but real-device testing showed
+// a large regression immediately after adding it — merge-corrected "double
+// detection" rate jumped from ~3-6% to ~53% of raw beats in the same
+// session type that had been clean before. Most likely cause: locking after
+// only a 600ms settle delay pinned a bad exposure value before the camera
+// had actually adapted to the very dark, saturated "finger fully covering
+// the lens" scene, making the signal noisier for the rest of the scan
+// rather than more stable. This couldn't be tested against real hardware
+// before shipping, and the real-device result contradicted the theory —
+// same lesson as the PLR outlier-rejection revert earlier in this project:
+// when live testing and an untested theoretical fix disagree, trust the
+// live testing and revert rather than keep guessing at parameters.
 
-function beginScan(torchOn, exposureLocked) {
+function beginScan(torchOn) {
     running = true;
     scanStartTime = performance.now();
     times = []; filtered = []; dcBaseline = null; smoothBuf = []; rising = false;
@@ -679,7 +663,7 @@ function beginScan(torchOn, exposureLocked) {
     freqPanel.style.display = 'none';
     bpmNumber.textContent = '—'; bpmNumber.classList.add('dim');
     hrConfidence.textContent = 'acquiring...'; hrConfidence.className = 'confidence';
-    ampStatus.textContent = (torchOn ? 'torch on' : 'torch unavailable') + (exposureLocked ? ', exposure locked' : '');
+    ampStatus.textContent = torchOn ? 'torch on' : 'torch unavailable — use bright ambient light';
     breathMarkBtn.style.display = 'block'; breathMarkBtn.textContent = 'Mark: inhale starting';
 
     if (scanMode === 'fixed30') {
