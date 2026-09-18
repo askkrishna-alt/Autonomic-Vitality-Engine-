@@ -560,16 +560,26 @@ let secondsRemaining = 30, elapsedSec = 0;
 let scanTimerInterval = null, liveAnalysisTimer = null, autoStopTimer = null;
 
 const CONTINUOUS_AUTO_STOP_MS = 10 * 60 * 1000;
-const MIN_PEAK_GAP_MS = 320;
-const PROMINENCE_FRACTION = 0.35;
+// Raised from 320ms: synthetic testing (against a modeled PPG beat with a
+// dicrotic notch + tidal/diastolic wave) showed the notch/tidal-wave
+// complex commonly lands 320-340ms after the true systolic peak - almost
+// exactly at the old refractory boundary - so it frequently slipped through
+// as a second "beat". 380ms still allows up to ~158bpm (well above any
+// realistic resting/wellness-scan heart rate) while reliably keeping the
+// notch/tidal wave inside the same refractory window as its true beat.
+const MIN_PEAK_GAP_MS = 380;
+const PROMINENCE_FRACTION = 0.42;
 const PROMINENCE_WINDOW_N = 45; // ~1.5s at ~30fps
+const RAW_LOWPASS_N = 5;   // causal low-pass on raw green channel, pre-baseline
+const AC_SMOOTH_N = 3;     // light smoothing on the AC (post-baseline) signal
 
 let times = [];       // ms since scan start, per processed frame
 let filtered = [];    // EMA-baseline-removed, lightly smoothed AC signal
 let dcBaseline = null;
+let rawBuf = [];      // causal low-pass buffer on raw green channel
 let smoothBuf = [];
-let rising = false;
 let peaks = [];        // ms timestamps of detected beats
+let peakVals = [];     // AC value at each detected beat, parallel to peaks[]
 let correctedIntervals = [];
 let missedBeatCount = 0, pauseCount = 0, doubleDetectionCount = 0, rawIntervalCount = 0;
 const PAUSE_MS = 5000, PAUSE_RATIO = 6, MIN_PLAUSIBLE_MS = 400;
@@ -652,8 +662,8 @@ async function startCapture() {
 function beginScan(torchOn) {
     running = true;
     scanStartTime = performance.now();
-    times = []; filtered = []; dcBaseline = null; smoothBuf = []; rising = false;
-    peaks = []; correctedIntervals = []; beatShapes = []; breathMarkers = []; breathPhase = 'inhale';
+    times = []; filtered = []; dcBaseline = null; rawBuf = []; smoothBuf = [];
+    peaks = []; peakVals = []; correctedIntervals = []; beatShapes = []; breathMarkers = []; breathPhase = 'inhale';
     missedBeatCount = 0; pauseCount = 0; doubleDetectionCount = 0; rawIntervalCount = 0;
     finalTimeResult = null; finalFreqResult = null;
 
@@ -738,51 +748,92 @@ function processFrame() {
     const now = performance.now() - scanStartTime;
     times.push(now);
 
-    if (dcBaseline === null) dcBaseline = g;
-    dcBaseline = dcBaseline * 0.97 + g * 0.03; // ~1-2s EMA time constant at ~30fps
+    // Causal low-pass on the raw green channel BEFORE baseline/AC math. This
+    // is a real-world/real-device-motivated addition: the live per-frame
+    // signal only had a 2-sample AC smoothing buffer downstream, which is
+    // not enough to knock down ordinary camera sensor noise, and that noise
+    // was found (via synthetic testing) to be enough on its own to trip the
+    // old single-sample slope-reversal detector. A wider low-pass here cuts
+    // that noise at the source, before it ever reaches the peak detector.
+    rawBuf.push(g);
+    if (rawBuf.length > RAW_LOWPASS_N) rawBuf.shift();
+    const gSmooth = rawBuf.reduce((a, b) => a + b, 0) / rawBuf.length;
+
+    if (dcBaseline === null) dcBaseline = gSmooth;
+    dcBaseline = dcBaseline * 0.97 + gSmooth * 0.03; // ~1-2s EMA time constant at ~30fps
     // Systole (more blood in the fingertip) absorbs more of the flash's light,
     // so the camera sees LESS brightness during systole and MORE during
     // diastole — i.e. raw green-channel value g DROPS at the true pulse peak.
     // Inverting here (baseline minus current, not current minus baseline) so
     // systole produces a positive/upward deflection, matching how PPG traces
-    // are conventionally drawn and read. Without this inversion the detector
-    // was locking onto brightness maxima (diastole) rather than the true
-    // systolic peak, and — because the diastolic phase is where the gentler
-    // dicrotic notch/tidal wave live — inverted orientation made those
-    // secondary features look sharper/more peak-like than the true systolic
-    // upstroke, a likely contributor to the high false-detection rate seen
-    // in testing.
-    const acRaw = dcBaseline - g;
+    // are conventionally drawn and read.
+    const acRaw = dcBaseline - gSmooth;
 
     smoothBuf.push(acRaw);
-    if (smoothBuf.length > 2) smoothBuf.shift();
+    if (smoothBuf.length > AC_SMOOTH_N) smoothBuf.shift();
     const ac = smoothBuf.reduce((a, b) => a + b, 0) / smoothBuf.length;
     filtered.push(ac);
 
     const MAXLEN = 30 * 20; // keep ~20s for display; peaks/intervals persist separately
     if (times.length > MAXLEN) { times.shift(); filtered.shift(); }
 
-    detectPeak(ac, now);
+    detectPeak(now);
     drawWaveform();
 }
 
-function detectPeak(ac, now) {
-    if (filtered.length < 8) return;
-    const prev = filtered[filtered.length - 2];
-    const wasRising = rising;
-    rising = ac > prev;
+// Peak picking, redesigned around two findings from synthetic ground-truth
+// testing done against a modeled PPG beat (systolic peak + dicrotic notch +
+// tidal/diastolic wave), after real-device testing kept showing elevated
+// false-beat/merge rates even once signal polarity was corrected:
+//
+// 1) A single-sample slope-sign flip (the old "wasRising && !rising" test)
+//    is too easily tripped by ordinary sensor noise, especially right after
+//    a real peak where the signal is nearly flat for a moment. A strict
+//    5-point local-maximum test (2 lower samples on BOTH sides) needs a
+//    real, sustained turning point and is far less noise-sensitive. This
+//    costs a small, constant ~2-sample detection delay, which doesn't
+//    affect interval/HRV math since both the previous and current peak are
+//    delayed by the same fixed amount.
+//
+// 2) Even with clean detection, the dicrotic notch + tidal wave IS a real,
+//    physically-present secondary local maximum — no amount of smoothing
+//    removes it, since it's genuine signal, not noise. The fix that's
+//    actually proven on real hardware (ported from this developer's own
+//    working PulseScope app) is a "replace, don't add" rule: a new local
+//    max found within MIN_PEAK_GAP_MS of the last *accepted* one never
+//    registers as a second beat — it only REPLACES that beat if it's
+//    taller. Since the true systolic peak is reliably taller than the
+//    notch/tidal wave that follows it, this structurally keeps the pair
+//    collapsed into one beat, rather than relying on an amplitude
+//    threshold to guess the difference (which testing showed isn't
+//    reliable — the notch/tidal-wave complex can be a large fraction of
+//    the full beat's amplitude).
+function detectPeak(now) {
+    const i = filtered.length - 1;
+    if (i < 4) return;
+    const c = i - 2; // candidate index, 2 samples back (confirmation delay)
+    const y0 = filtered[c - 2], y1 = filtered[c - 1], y2 = filtered[c], y3 = filtered[c + 1], y4 = filtered[c + 2];
+    const isLocalMax = y2 > y1 && y2 >= y3 && y2 > y0 && y2 > y4;
+    if (!isLocalMax) return;
 
-    const sinceLastPeak = peaks.length ? now - peaks[peaks.length - 1] : 9999;
-    const recentWindow = filtered.slice(-Math.min(filtered.length, PROMINENCE_WINDOW_N));
+    const peakVal = y2, peakTime = times[c];
+    const recentWindow = filtered.slice(Math.max(0, c - PROMINENCE_WINDOW_N), c + 1);
     const localMin = Math.min(...recentWindow), localMax = Math.max(...recentWindow);
     const localRange = (localMax - localMin) || 0.001;
-    const prominence = ac - localMin;
+    const prominence = peakVal - localMin;
     const isProminent = prominence > localRange * PROMINENCE_FRACTION;
+    if (!isProminent) return;
 
-    if (wasRising && !rising && sinceLastPeak > MIN_PEAK_GAP_MS && isProminent) {
+    if (peaks.length === 0 || (peakTime - peaks[peaks.length - 1]) >= MIN_PEAK_GAP_MS) {
         const prevPeakTime = peaks.length ? peaks[peaks.length - 1] : null;
-        peaks.push(now);
-        if (prevPeakTime !== null) { recordInterval(now - prevPeakTime); captureBeatShape(prevPeakTime, now); }
+        peaks.push(peakTime); peakVals.push(peakVal);
+        if (prevPeakTime !== null) { recordInterval(peakTime - prevPeakTime); captureBeatShape(prevPeakTime, peakTime); }
+    } else if (peakVal > peakVals[peakVals.length - 1]) {
+        // A taller candidate inside the same refractory window replaces the
+        // one just accepted (e.g. detection confirmed slightly early on a
+        // noisy sample) — this does not count as a new beat.
+        peaks[peaks.length - 1] = peakTime;
+        peakVals[peakVals.length - 1] = peakVal;
     }
 }
 
