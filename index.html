@@ -1119,16 +1119,34 @@ function runFrequencyAnalysis() {
     const lfHfRatio = hf > 0.0001 ? lf / hf : null;
     const lfNu = totalForNu > 0 ? (lf / totalForNu * 100) : null;
     const hfNu = totalForNu > 0 ? (hf / totalForNu * 100) : null;
+    // Respiratory peak search widened to 0.08-0.40Hz (was fixed to the HF
+    // band, 0.15-0.40Hz only). That range couldn't represent slow/relaxed
+    // breathing below ~9 breaths/min at all — any true respiratory rate
+    // slower than that would get clipped to exactly 0.15Hz (9bpm) rather
+    // than reported accurately, which also hid how far the respiratory
+    // oscillation was actually sitting below the fixed LF/HF boundary.
     let peakIdx = -1, peakVal = -Infinity;
-    for (let k = 0; k < welch.freqs.length; k++) if (welch.freqs[k] >= 0.15 && welch.freqs[k] <= 0.40 && welch.psd[k] > peakVal) { peakVal = welch.psd[k]; peakIdx = k; }
+    for (let k = 0; k < welch.freqs.length; k++) if (welch.freqs[k] >= 0.08 && welch.freqs[k] <= 0.40 && welch.psd[k] > peakVal) { peakVal = welch.psd[k]; peakIdx = k; }
     const breathingHz = peakIdx >= 0 ? welch.freqs[peakIdx] : null;
     const breathingBpm = breathingHz ? Math.round(breathingHz * 60) : null;
+    // Slow-breathing LF/HF caveat flag: the LF/HF split uses a fixed 0.15Hz
+    // boundary (standard in the HRV literature), but respiratory sinus
+    // arrhythmia — a parasympathetically-driven oscillation — sits AT the
+    // breathing frequency. When breathing is slower than ~11/min (<0.18Hz),
+    // that real RSA power falls at or below the boundary and gets counted
+    // as "LF" instead of "HF", inflating LF/HF and suppressing HF% even
+    // though the underlying state can be genuinely calm. This is a
+    // well-documented measurement artifact (see e.g. Task Force 1996
+    // guidance on paced/slow breathing), not a sign of sympathetic
+    // activation, so it's surfaced explicitly rather than silently reported
+    // as "more sympathetic-leaning."
+    const slowBreathingArtifact = breathingHz !== null && breathingHz < 0.18;
     let confidenceTier, confidenceLabel;
     if (duration < 60) { confidenceTier = 'low'; confidenceLabel = 'ultra-short (<60s)'; }
     else if (duration < 120) { confidenceTier = 'low'; confidenceLabel = 'short (60-120s)'; }
     else if (duration < 300) { confidenceTier = 'medium'; confidenceLabel = 'below 5-min standard'; }
     else { confidenceTier = 'high'; confidenceLabel = 'standard window'; }
-    return { freqs: welch.freqs, psd: welch.psd, lf, hf, vlf, totalPower, lfHfRatio, lfNu, hfNu, breathingHz, breathingBpm, durationSec: duration, confidenceTier, confidenceLabel };
+    return { freqs: welch.freqs, psd: welch.psd, lf, hf, vlf, totalPower, lfHfRatio, lfNu, hfNu, breathingHz, breathingBpm, slowBreathingArtifact, durationSec: duration, confidenceTier, confidenceLabel };
 }
 
 function renderFrequencyResult(r, isLive) {
@@ -1158,7 +1176,17 @@ function renderFrequencyResult(r, isLive) {
 
     const interpBox = document.getElementById('interpBox');
     if (r.lfNu !== null && r.hfNu !== null) {
-        if (r.lfNu > r.hfNu + 10) {
+        if (r.slowBreathingArtifact && r.lfNu > r.hfNu + 10) {
+            interpBox.className = 'interp-box';
+            interpBox.innerHTML = `<b>LF reads higher than HF, but likely as a measurement artifact of slow
+                breathing</b> (${r.breathingBpm} breaths/min), not true sympathetic activation. The LF/HF split
+                uses a fixed 0.15Hz boundary; at this breathing rate, respiratory sinus arrhythmia — itself a
+                parasympathetic (relaxed) signal — falls at or below that line and gets counted as "LF" instead
+                of "HF", which inflates LF/HF and suppresses HF% without reflecting a genuine stress pattern.
+                This is a well-documented limitation of fixed-band LF/HF analysis during slow/relaxed breathing,
+                not a diagnosis. Time-domain RMSSD/SDNN above are not affected by this and are the more reliable
+                indicator here.`;
+        } else if (r.lfNu > r.hfNu + 10) {
             interpBox.className = 'interp-box amber';
             interpBox.innerHTML = `<b>LF appears more prominent than HF</b> in this window, a pattern often
                 associated with more sympathetic ("fight or flight") nervous system activity relative to a
@@ -1235,8 +1263,15 @@ function computeAutonomicState() {
     const freq = finalFreqResult;
 
     const components = [];
-    if (rmssd !== null) components.push({ v: Math.max(0, Math.min(100, 100 - (rmssd / 70) * 100)), w: 0.45 });
-    if (freq && freq.hfNu !== null) components.push({ v: Math.max(0, Math.min(100, 100 - freq.hfNu)), w: 0.35 });
+    // When slow breathing pushes RSA power at/below the fixed 0.15Hz LF/HF
+    // boundary (see runFrequencyAnalysis' slowBreathingArtifact flag), HF%
+    // gets artificially suppressed regardless of true autonomic state — so
+    // that component's weight is folded into RMSSD instead (time-domain,
+    // not affected by band-boundary placement) rather than let a known
+    // measurement artifact drive the composite score toward "sympathetic."
+    const hfNuIsReliable = !(freq && freq.slowBreathingArtifact);
+    if (rmssd !== null) components.push({ v: Math.max(0, Math.min(100, 100 - (rmssd / 70) * 100)), w: hfNuIsReliable ? 0.45 : 0.80 });
+    if (freq && freq.hfNu !== null && hfNuIsReliable) components.push({ v: Math.max(0, Math.min(100, 100 - freq.hfNu)), w: 0.35 });
     if (freq && freq.breathingBpm) {
         const bpm = freq.breathingBpm;
         const rrScore = bpm <= 10 ? 0 : bpm >= 30 ? 100 : ((bpm - 10) / 20) * 100;
@@ -1308,11 +1343,17 @@ function renderAutonomicReport() {
         <div class="metric-card"><div class="m-label">${label}</div><div class="m-value">${value}</div></div>
     `).join('');
 
-    document.getElementById('reportDisclaimer').innerHTML = `This is a heuristic wellness composite built from the
+    let disclaimerHtml = `This is a heuristic wellness composite built from the
         HR/HRV/respiration measurements above — it is <b>not a validated clinical staging instrument</b> and not a
         diagnosis. Terms like "sustained strain" and "depletion" describe a single-session physiological pattern,
         not a confirmed chronic or clinical condition. Pupillary (PLR) results are shown separately above and are
         not factored into this score, given their known measurement variability.`;
+    if (finalFreqResult && finalFreqResult.slowBreathingArtifact) {
+        disclaimerHtml += ` Your breathing rate this scan (${finalFreqResult.breathingBpm} breaths/min) was slow
+            enough that HF-band power is not reliable (see the frequency-domain panel above) — this score weights
+            RMSSD more heavily instead for that reason.`;
+    }
+    document.getElementById('reportDisclaimer').innerHTML = disclaimerHtml;
 
     renderPoincareSection();
     renderMeanPulseWaveSection();
